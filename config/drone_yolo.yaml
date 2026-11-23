@@ -1,0 +1,76 @@
+# ==========================================================================
+# Preset: motion + a purpose-trained drone YOLO, combined by fusion.
+# ==========================================================================
+# Deep-merged over config/default.yaml, so only the differences appear here.
+#
+#   python tools/fetch_weights.py --model yolov11x
+#   pip install ultralytics
+#   python -m src.main --source clip.mp4 --config config/drone_yolo.yaml
+#
+# If ultralytics or the weights file are missing, build_detector logs the reason
+# and falls back to motion-only. It will not crash, but it will also not tell
+# you loudly - check the log line if results look unchanged, and check that the
+# HUD's DETECTOR field reads FUSION rather than MOTION.
+# ==========================================================================
+
+detection:
+  # fusion, not cnn. The two detectors fail in opposite places and that is the
+  # point: the motion path finds a 12 px contact with no texture, which is
+  # precisely where an appearance model has nothing to work with; the CNN says
+  # what a well-resolved object actually *is*, which motion can never do.
+  # Running cnn alone throws away the long-range capability this project exists
+  # for.
+  backend: fusion
+
+  # Detect on every frame. This assumes a GPU (see cnn.device below) and is the
+  # setting you want whenever you can afford it.
+  #
+  # Skipping frames is NOT a cheap trade, which is worth stating because it
+  # looks like one: measured motion-only, interval 3 costs 12 points of recall
+  # (92.8 -> 80.6 %) and 21 of precision on a real chase-camera clip; on the
+  # synthetic suite interval 2 alone drops static F1 95.5 -> 79.4 % and hard
+  # 87.7 -> 74.3 %. Raise it only when the alternative is not running the CNN at
+  # all - on CPU, where these models cost 1-2 s per frame, that is exactly the
+  # situation, and `--set detection.interval=3` is then the right call.
+  #
+  # TRAP if you do raise it: motion.warmup_frames counts *detector invocations*,
+  # not video frames, so at interval 3 the background model settles over 90
+  # video frames and the system reports nothing at all until then. A short test
+  # run (--max-frames 40) looks like a total failure while working exactly as
+  # designed. Give it 150+ frames before judging.
+  interval: 1
+
+  cnn:
+    # Written by tools/fetch_weights.py. Override per run with
+    #   --set detection.cnn.weights=weights/drone_yolov8x.pt
+    weights: weights/drone_yolov11x.pt
+    # Small objects need resolution more than they need a bigger model: a 15 px
+    # drone at imgsz 640 is under 8 px by the time it reaches the network, below
+    # what the smallest detection head can resolve. Costs roughly 4x the compute
+    # of 640.
+    imgsz: 1280
+    confidence: 0.25
+    # "0" = first CUDA device. Falls back to CPU by itself if no GPU is visible,
+    # but silently and far slower, so verify rather than assume:
+    #     python -c "import torch; print(torch.cuda.is_available())"
+    # A False there on a machine that has a GPU almost always means a CPU-only
+    # PyTorch build. Installing ultralytics pulls the CPU build by default on
+    # Windows - the CUDA one has to be requested from PyTorch's own index.
+    # Use "cpu" on a machine without a GPU, "mps" on Apple silicon.
+    device: "0"
+
+  fusion:
+    # A motion contact and a CNN box are the same object above this IoU. Kept
+    # deliberately low: the motion path boxes the moving *part* of an airframe
+    # while the CNN boxes the whole thing, so their boxes agree on position far
+    # better than they agree on extent.
+    match_iou: 0.30
+
+# NOTE: tracking.max_age is deliberately NOT raised here. It had to be while
+# this preset ran at interval 3, but since Track.predict learned to tell "the
+# detector did not run" from "the detector found nothing", a skipped frame no
+# longer ages a track at all - so the default budget is already correct.
+
+# Single-class drone models make cnn.py drop the COCO proxy filter
+# automatically (it keys off the class count), so no code change is needed and
+# detection.cnn.coco_proxy_classes stays inert here.

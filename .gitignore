@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated clips, exports and snapshots
+output/*.mp4
+output/*.jsonl
+output/*_groundtruth.json
+output/*_check.jpg
+output/snapshots/
+!output/.gitkeep
+
+# Real test footage: large and not redistributable. See README.
+video/
+
+# Model weights, fetched by tools/fetch_weights.py
+weights/
+*.pt
+
+# Screenshots in docs/images ARE tracked - do not add docs/ here

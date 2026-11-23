@@ -1,0 +1,298 @@
+# ==========================================================================
+# UAS Detection & Tracking System - Default Configuration
+# ==========================================================================
+# All tunable parameters live here. Override a subset with --config myfile.yaml
+# (missing keys fall back to these defaults via deep-merge).
+# ==========================================================================
+
+video:
+  # Target processing resolution. Frames are resized so the long edge matches
+  # this value; set to 0 to process at native resolution.
+  process_width: 1280
+  # Loop the source video when it reaches the end (useful for tuning).
+  loop: false
+
+detection:
+  # Which detector stack to run: "motion" | "cnn" | "fusion"
+  #   motion - background/ego-motion based blob detection. No model needed.
+  #   cnn    - neural detector (ultralytics YOLO). Needs weights + package.
+  #   fusion - run both, combine evidence. Best accuracy, highest cost.
+  backend: motion
+
+  # Run detection only every Nth frame; the tracker coasts on its motion model
+  # in between. 1 = detect every frame. Raise for higher throughput.
+  interval: 1
+
+  motion:
+    # Camera motion regime: "static" | "moving" | "auto"
+    #   static - MOG2 background model only (tripod / fixed mast).
+    #   moving - ego-motion compensated frame differencing (gimbal / handheld).
+    #   auto   - estimate global motion per frame and pick automatically.
+    camera_motion: auto
+    # Global displacement (px, median) above which "auto" switches to moving mode.
+    ego_motion_threshold: 1.5
+    # Leaving moving mode uses a lower threshold (ego_motion_threshold * this)
+    # and requires the camera to stay still for camera_settle_frames, so a gimbal
+    # that pauses at the end of a sweep does not flap between modes.
+    ego_leave_ratio: 0.4
+    camera_settle_frames: 8
+
+    # --- MOG2 background subtractor ---
+    mog2_history: 320
+    mog2_var_threshold: 28.0
+    mog2_learning_rate: 0.006
+    # Sensor settling: for this many frames the background model adapts fast and
+    # the detector emits nothing. Prevents a target present at start-up from
+    # being baked into the background and leaving a permanently-detected ghost
+    # at its initial position. Raise for noisier scenes, lower for faster
+    # time-to-first-detection.
+    # NOTE: counted in *detector invocations*, not video frames. With
+    # detection.interval = N, settling spans warmup_frames * N video frames.
+    warmup_frames: 30
+    mog2_warmup_learning_rate: 0.12
+
+    # --- Ego-motion compensated differencing ---
+    stab_max_features: 900
+    stab_quality: 0.012
+    stab_min_distance: 8
+    diff_threshold: 16          # base absdiff threshold on smooth regions (0-255)
+    # Per-pixel threshold is `diff_threshold + edge_sensitivity * local_gradient`,
+    # with the gradient taken from the motion-compensated previous frame.
+    #
+    # This was 0 (off) for as long as the system was only ever measured on
+    # synthetic clips, and on those the earlier note was correct: against open
+    # sky the false contacts are not edge artefacts, so the setting bought
+    # nothing and cost recall. That conclusion did not survive contact with real
+    # video. On a handheld pan over a street (a clip containing no airborne
+    # target at all, so every contact is provably false) the flat threshold
+    # produced 161 false tracks per minute and a false lock on 96 % of frames -
+    # the scene is nothing but the hard edges this term exists to tolerate.
+    # At 0.15: 65 false tracks per minute, and on a chase-camera clip F1 rose
+    # 48 -> 85 % (precision 33 -> 78 %).
+    #
+    # 0.15 rather than higher is deliberate. 0.25 suppresses more clutter
+    # (46 false tracks/min) but costs 13 points of recall on a real target
+    # (92.8 -> 80.2 %) and 10 points on the synthetic pan clip; 0.55 collapses
+    # recall to 26 %. 0.15 costs nothing on any synthetic scenario - the pan
+    # clip actually improves - so it is the setting that regresses nothing.
+    # Raise it for genuinely cluttered deployments (urban skylines, tree lines),
+    # and re-measure with tools/bench_real.py rather than judging by eye.
+    edge_sensitivity: 0.15
+
+    # --- Morphology ---
+    open_kernel: 3              # removes speckle noise
+    dilate_kernel: 5            # merges fragmented blobs of one object
+    dilate_iterations: 2
+
+    # --- Blob filtering ---
+    # Small objects are kept deliberately: a distant UAS can be <20 px. False
+    # positives are rejected temporally by the tracker (min_hits), not here.
+    min_area: 12
+    max_area_ratio: 0.08        # reject blobs larger than this fraction of frame
+    min_aspect: 0.22            # w/h bounds - rejects lens flare streaks / edges
+    max_aspect: 4.5
+    min_fill_ratio: 0.18        # contour area / bbox area - rejects thin lines
+    border_margin: 2            # drop blobs touching the frame edge (px)
+    max_detections: 60          # safety cap per frame
+    # Fragment merging: boxes are expanded by this fraction of their own size,
+    # and anything still overlapping is merged into one contact. Stops a faint
+    # target that thresholds into two or three pieces from becoming two or three
+    # tracks. Raise if one object still shows as several contacts; lower if two
+    # genuinely separate contacts flying in formation get merged.
+    fragment_merge_margin: 0.6
+
+    # --- Sensitive path for small, low-contrast targets --------------------
+    # Finds distant/hazy/defocused targets (~10 px, only a few grey levels of
+    # contrast) that the primary threshold misses, by requiring small-blob
+    # *shape* evidence (bidirectional top-hat) together with much weaker motion
+    # evidence. Strictly additive to the primary mask - see small_target.py.
+    small_target:
+      enabled: true
+      # Restrict the sensitive path to static-camera mode. Its thresholds assume
+      # the clean residual a background model produces; a motion-compensated
+      # frame difference has a much heavier tail. Measured on the pan clip,
+      # allowing it in moving mode cost 18 points of precision (82.5 -> 64.5 %)
+      # with no recall gain.
+      static_only: true
+      # The residual threshold is derived per frame as
+      #   max(min_residual, p(background_percentile) * threshold_scale + threshold_margin)
+      # so the detector calibrates itself to each clip's noise level instead of
+      # relying on a constant that only suits one recording.
+      background_percentile: 99.5
+      # Multiplier on that percentile.
+      #
+      # MEASURED, do not raise without re-running tools/bench_synthetic.py.
+      # Raising this to 2.5 was tried to suppress noise contacts on a real
+      # night-CCTV clip, where it worked well (precision 11.4 -> 40.5 % at
+      # unchanged recall). It cost 16 points of recall on the synthetic hard
+      # clip (83.8 -> 67.9 %), because that clip's hazy background does have a
+      # non-zero residual percentile, so scaling it lifts the threshold above
+      # the 4-10 grey levels the faint target actually produces. The sensitive
+      # path exists for exactly that target, so the floor stays where it is and
+      # noisy scenes are handled by max_candidates below instead.
+      threshold_scale: 1.0
+      threshold_margin: 2.0
+      # Absolute floor in grey levels. Keep at or above roughly 1.5x the sensor
+      # noise sigma; below that the tracker sees enough noise candidates for
+      # association quality to start suffering.
+      min_residual: 4.0
+      # Connected pixels required above the threshold BEFORE dilation. This is
+      # what allows min_residual to stay low: noise crosses a permissive
+      # threshold as isolated pixels, a real target as a connected core. Raise
+      # to suppress noise contacts, lower if very small targets are missed.
+      min_core_pixels: 4
+      # Components larger than this are not small targets; left to the primary
+      # detector and discarded here.
+      max_area: 900
+      # Cap on how many candidates the sensitive path may emit per frame. When
+      # more survive the size filters, the strongest by peak residual are kept
+      # and the rest dropped - that many simultaneous "small targets" means the
+      # per-frame threshold was defeated by noise, not that the sky filled with
+      # drones. Measured on a night CCTV clip this path was producing ~23
+      # phantom contacts per frame (81 % of all detections) on a scene with one
+      # real light. Ranking rather than raising the threshold is deliberate: the
+      # target is the frame-wide residual maximum, so it survives the cut while
+      # the noise tail does not, and faint-target recall is unaffected.
+      # Raise it if you genuinely expect many simultaneous distant contacts
+      # (a swarm); set 0 to disable the cap.
+      max_candidates: 12
+      dilate_size: 3
+      # Temporal integration (track-before-detect):
+      #   acc <- temporal_decay * dilate(acc, motion_radius) + residual
+      # DEFAULT OFF (0.0), and measured to be harmful in this isotropic form:
+      # at decay 0.7 recall rose 84.7 -> 88.3 % but precision collapsed
+      # 89.2 -> 2.4 %. The dilation spreads accumulated evidence in every
+      # direction each frame, so any persistent residual blooms into an
+      # ever-growing disc and the frame fills with candidates.
+      # Doing this properly needs a bank of accumulators shifted along
+      # hypothesised target velocities, not isotropic spreading. Left in place
+      # as a starting point - do not enable without re-measuring.
+      temporal_decay: 0.0
+      motion_radius: 5
+      # Percentile is computed on every Nth pixel - a noise statistic does not
+      # need the full frame, and this keeps the cost negligible.
+      sample_stride: 4
+
+    # Confidence model: score = w_area*f(area) + w_contrast*f(contrast) + base
+    conf_base: 0.30
+    conf_area_weight: 0.25
+    conf_contrast_weight: 0.45
+    contrast_reference: 45.0    # mean |ROI - local background| that maps to 1.0
+
+  cnn:
+    weights: yolov8n.pt         # path to .pt weights (custom UAS model recommended)
+    confidence: 0.25
+    iou: 0.45
+    device: cpu                 # "cpu" | "0" | "cuda:0" | "mps"
+    imgsz: 960
+    # Generic COCO models have no "drone" class. These COCO classes act as a
+    # stand-in for airborne objects until custom weights are trained.
+    # See docs/ARCHITECTURE.md > "Get a real UAS detector".
+    coco_proxy_classes: [4, 14, 33]   # airplane, bird, kite
+    remap_label: AIR-CONTACT
+
+  fusion:
+    # IoU above which a motion blob and a CNN box are considered the same object.
+    match_iou: 0.30
+    # Overlapping evidence combines as 1-(1-a)(1-b), capped here.
+    max_combined_confidence: 0.97
+    # NMS threshold applied to the merged detection set.
+    nms_iou: 0.55
+
+tracking:
+  # Frames a track must be confirmed by detections before it is promoted from
+  # TENTATIVE to CONFIRMED. This is the main false-positive filter, and it is
+  # what lets the detector run permissively: noise candidates land at random
+  # positions and cannot be associated this many frames running, a real target
+  # can. Raised from 3 to 4 when the sensitive small-target path was added -
+  # measured to recover precision on faint targets (89 -> 93 %) for under one
+  # point of recall.
+  min_hits: 4
+  # Frames a track may coast without detections before deletion.
+  max_age: 30
+  # Coasting budget scales with track maturity: a track gets
+  #   max_age * (coast_floor + (1-coast_floor) * min(1, hits/coast_maturity_hits))
+  # Raise coast_floor if faint, intermittently-detected targets keep coming back
+  # with new IDs; lower it if departed objects linger too long on the display.
+  coast_floor: 0.5
+  coast_maturity_hits: 25
+  # Moving-target indication: pixels a track must have covered before it can be
+  # confirmed. A contact that has not moved is not an aircraft - measured on the
+  # clean test clip, every surviving false contact came from a stationary
+  # source (background-model residual at a cloud edge) with under 3 px of total
+  # displacement, while real tracks covered 151 px. This is a delay, not a veto:
+  # a slow target confirms as soon as it has moved far enough. Lower it if you
+  # need to hold a genuinely hovering target at long range.
+  min_displacement: 6.0
+  # Assignment gate: minimum IoU for a detection<->track match.
+  min_iou: 0.10
+  # Chi-square gate on Mahalanobis distance over centre position only
+  # (2 DoF, 0.95 -> 5.9915; 0.99 -> 9.2103). Size is deliberately excluded -
+  # see KalmanBoxFilter.gating_distance for why including it breaks tracking of
+  # faint targets whose apparent size is unstable.
+  mahalanobis_gate: 9.2103
+  # Fallback centre-distance gate in pixels, for fast small objects where the
+  # predicted and measured boxes may not overlap at all between frames.
+  max_center_distance: 45
+
+  kalman:
+    position_std: 0.05          # process noise on position, scaled by box size
+    velocity_std: 0.012         # process noise on velocity, scaled by box size
+    measurement_std: 0.06       # measurement noise, scaled by box size
+
+  priority:
+    # Primary-target scoring weights (highest score becomes the locked target).
+    w_confidence: 0.40
+    w_persistence: 0.25         # normalised hit count
+    w_size: 0.15
+    w_centrality: 0.20          # proximity to frame centre
+    # Score margin a challenger must exceed to steal the lock, plus how many
+    # frames it must hold that margin. Prevents lock flicker between targets.
+    switch_margin: 0.12
+    switch_frames: 8
+
+ui:
+  # white (default, greyscale) | tactical_amber | nightvision | arctic | ir_white
+  theme: white
+  show_hud: true
+  show_grid: true
+  show_trails: true
+  trail_length: 48
+  show_pip: true                # picture-in-picture overview when zoomed
+  show_all_tracks: true         # draw non-primary tracks too
+  show_detections: false        # raw per-frame detections (debug)
+  show_mask: false              # motion mask inset (debug)
+  reticle_scale: 1.0
+  scanlines: false              # subtle CRT effect, purely cosmetic
+
+zoom:
+  enabled: true
+  initial: 1.0
+  min: 1.0
+  max: 8.0
+  step: 1.25                    # multiplicative step per +/- keypress
+  # Auto-follow keeps the zoom window centred on the locked target.
+  auto_follow: true
+  follow_smoothing: 0.15        # EMA factor; lower = smoother/laggier
+  # Automatically zoom so the target fills this fraction of the viewport.
+  auto_zoom: false
+  auto_zoom_target_fill: 0.22
+
+focus:
+  enabled: true
+  # Sharpness is measured as the variance of the Laplacian over the target ROI.
+  metric_window: 30             # frames of history for the trend indicator
+  # Value that maps to 100% on the sharpness bar. Sensor/lens dependent.
+  reference_sharpness: 420.0
+  # "Focus assist": unsharp-mask the zoomed viewport so a soft target is easier
+  # to judge by eye. Purely a display aid - it does not change the pixels used
+  # for detection.
+  assist: true
+  assist_amount: 0.6
+  assist_radius: 3
+
+export:
+  # JSONL track export: one record per frame with all active tracks.
+  include_tentative: false
+  # Annotated video recording codec.
+  fourcc: mp4v
